@@ -1,0 +1,47 @@
+# Python
+
+**pycache**/
+*.pyc
+
+# Virtual environments
+
+.env
+.venv
+venv/
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# Data / models (large files)
+
+data/
+datasets/
+checkpoints/
+models/
+
+# Experiment outputs
+
+outputs/
+results/
+runs/
+
+# Logs
+
+*.log
+
+# IDE
+
+.vscode/
+.idea/
+
+# macOS
+
+.DS_Store
+
+# Data
+
+financial_agentic_benchmark/
+.claude/
+.codex/
+
