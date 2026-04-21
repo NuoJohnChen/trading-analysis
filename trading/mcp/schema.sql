@@ -1,23 +1,29 @@
 CREATE TABLE IF NOT EXISTS filings (
-    ticker      VARCHAR NOT NULL,
-    filing_date VARCHAR NOT NULL,
-    form_type   VARCHAR NOT NULL,
-    content     TEXT,
-    PRIMARY KEY (ticker, filing_date, form_type)
+    id            INTEGER PRIMARY KEY,
+    symbol        VARCHAR NOT NULL,
+    date          DATE NOT NULL,
+    mda_content   TEXT,
+    risk_content  TEXT,
+    document_type VARCHAR NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS news (
-    ticker  VARCHAR NOT NULL,
-    date    VARCHAR NOT NULL,
-    item_id INTEGER NOT NULL,
-    content TEXT,
-    PRIMARY KEY (ticker, date, item_id)
+    id         INTEGER PRIMARY KEY,
+    symbol     VARCHAR NOT NULL,
+    date       TIMESTAMP NOT NULL,
+    title      TEXT,
+    url        TEXT,
+    highlights TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prices (
-    ticker   VARCHAR NOT NULL,
-    date     VARCHAR NOT NULL,
-    price    DOUBLE,
-    momentum VARCHAR,
-    PRIMARY KEY (ticker, date)
+    id        INTEGER PRIMARY KEY,
+    symbol    VARCHAR NOT NULL,
+    date      DATE NOT NULL,
+    open      DOUBLE,
+    high      DOUBLE,
+    low       DOUBLE,
+    close     DOUBLE,
+    adj_close DOUBLE,
+    volume    BIGINT
 );

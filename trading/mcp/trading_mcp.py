@@ -26,7 +26,7 @@ import pandas_ta as _ta  # noqa: E402
 
 DB_PATH = os.environ.get(
     "TRADING_DB_PATH",
-    str(Path(__file__).resolve().parent.parent / "db" / "trading_env.duckdb"),
+    str(Path(__file__).resolve().parent.parent / "env" / "trading_env.duckdb"),
 )
 
 mcp = FastMCP("trading_mcp")
@@ -43,106 +43,113 @@ def _connect() -> duckdb.DuckDBPyConnection:
 
 @mcp.tool(
     description=(
-        "Return SEC filings (10-K, 10-Q) for a ticker whose filing_date is in "
-        "[date_start, date_end] inclusive. To respect no-look-ahead, pass "
-        "date_end <= your current target trading day. For a typical past-year "
-        "window at a given target date T, use date_start = T - 1 year, date_end = T. "
-        "Returns rows of {ticker, filing_date, form_type, content}."
+        "Return SEC filings (10-K, 10-Q) for a symbol in [date_start, date_end] inclusive. "
+        "To respect no-look-ahead, pass date_end <= your current target trading day. "
+        "For a typical past-year window at a given target date T, use date_start = T - 1 year, date_end = T. "
+        "Returns rows of {symbol, date, document_type, mda_content, risk_content}."
     )
 )
 def get_filings(
-    ticker: Annotated[str, Field(description="Stock ticker, e.g. 'AAPL'")],
+    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
     date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
-    form_type: Annotated[
+    document_type: Annotated[
         Optional[str],
         Field(description="'10-K' or '10-Q'; omit for both"),
     ] = None,
 ) -> list[dict]:
     sql = (
-        "SELECT ticker, filing_date, form_type, content "
+        "SELECT symbol, CAST(date AS VARCHAR) AS date, "
+        "document_type, mda_content, risk_content "
         "FROM filings "
-        "WHERE ticker = ? AND filing_date >= ? AND filing_date <= ?"
+        "WHERE symbol = ? AND date >= ? AND date <= ?"
     )
-    params: list = [ticker, date_start, date_end]
-    if form_type is not None:
-        sql += " AND form_type = ?"
-        params.append(form_type)
-    sql += " ORDER BY filing_date DESC"
+    params: list = [symbol, date_start, date_end]
+    if document_type is not None:
+        sql += " AND document_type = ?"
+        params.append(document_type)
+    sql += " ORDER BY date DESC"
 
     with _connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [
-        {"ticker": r[0], "filing_date": r[1], "form_type": r[2], "content": r[3]}
+        {"symbol": r[0], "date": r[1], "document_type": r[2], "mda_content": r[3], "risk_content": r[4]}
         for r in rows
     ]
 
 
 @mcp.tool(
     description=(
-        "Return news items for a ticker in [date_start, date_end] inclusive. "
+        "Return news items for a symbol in [date_start, date_end] inclusive. "
         "To respect no-look-ahead, pass date_end <= your current target trading day. "
-        "Returns rows of {ticker, date, item_id, content}."
+        "Returns rows of {symbol, date, id, title, highlights}."
     )
 )
 def get_news(
-    ticker: Annotated[str, Field(description="Stock ticker, e.g. 'AAPL'")],
+    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
     date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
 ) -> list[dict]:
     sql = (
-        "SELECT ticker, date, item_id, content "
+        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, "
+        "id, title, highlights "
         "FROM news "
-        "WHERE ticker = ? AND date >= ? AND date <= ? "
-        "ORDER BY date ASC, item_id ASC"
+        "WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
+        "ORDER BY date ASC, id ASC"
     )
     with _connect() as conn:
-        rows = conn.execute(sql, [ticker, date_start, date_end]).fetchall()
+        rows = conn.execute(sql, [symbol, date_start, date_end]).fetchall()
     return [
-        {"ticker": r[0], "date": r[1], "item_id": r[2], "content": r[3]}
+        {"symbol": r[0], "date": r[1], "id": r[2], "title": r[3], "highlights": r[4]}
         for r in rows
     ]
 
 
 @mcp.tool(
     description=(
-        "Return daily prices and momentum label for a ticker in [date_start, date_end] inclusive. "
+        "Return daily OHLCV prices for a symbol in [date_start, date_end] inclusive. "
         "To respect no-look-ahead, pass date_end <= your current target trading day. "
         "Also useful to discover the list of trading days that have data. "
-        "Returns rows of {ticker, date, price, momentum}."
+        "Returns rows of {symbol, date, open, high, low, close, adj_close, volume}. "
+        "adj_close is the canonical trading price."
     )
 )
 def get_prices(
-    ticker: Annotated[str, Field(description="Stock ticker, e.g. 'AAPL'")],
+    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
     date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
 ) -> list[dict]:
     sql = (
-        "SELECT ticker, date, price, momentum "
+        "SELECT symbol, CAST(date AS VARCHAR) AS date, "
+        "open, high, low, close, adj_close, volume "
         "FROM prices "
-        "WHERE ticker = ? AND date >= ? AND date <= ? "
+        "WHERE symbol = ? AND date >= ? AND date <= ? "
         "ORDER BY date ASC"
     )
     with _connect() as conn:
-        rows = conn.execute(sql, [ticker, date_start, date_end]).fetchall()
+        rows = conn.execute(sql, [symbol, date_start, date_end]).fetchall()
     return [
-        {"ticker": r[0], "date": r[1], "price": r[2], "momentum": r[3]}
+        {
+            "symbol": r[0], "date": r[1],
+            "open": r[2], "high": r[3], "low": r[4],
+            "close": r[5], "adj_close": r[6], "volume": r[7],
+        }
         for r in rows
     ]
 
 
 @mcp.tool(
     description=(
-        "Return the latest available trading date in the prices table for a ticker. "
+        "Return the latest available trading date in the prices table for a symbol. "
         "Use this when no explicit target_date was supplied to the trading skill."
     )
 )
 def get_latest_date(
-    ticker: Annotated[str, Field(description="Stock ticker, e.g. 'AAPL'")],
+    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
 ) -> Optional[str]:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT MAX(date) FROM prices WHERE ticker = ?", [ticker]
+            "SELECT CAST(MAX(date) AS VARCHAR) FROM prices WHERE symbol = ?", [symbol]
         ).fetchone()
     return row[0] if row and row[0] else None
 
@@ -163,23 +170,24 @@ _INDICATOR_WARMUP_DAYS = {
 
 @mcp.tool(
     description=(
-        "Compute a technical indicator from the prices table for a ticker over "
+        "Compute a technical indicator from the prices table for a symbol over "
         "[date_start, date_end] inclusive. Prices history before date_start is "
         "auto-fetched as warmup. The agent decides which indicators to compute "
         "and when — this tool is optional.\n\n"
         "Supported indicators:\n"
-        "  - 'ma'     simple moving average. Default length=20. Returns {date, ma}.\n"
-        "  - 'rsi'    relative strength index. Default length=14. Returns {date, rsi}.\n"
-        "  - 'bbands' Bollinger Bands. Default length=20, stddev=2. "
+        "  - 'ma'       simple moving average. Default length=20. Returns {date, ma}.\n"
+        "  - 'rsi'      relative strength index. Default length=14. Returns {date, rsi}.\n"
+        "  - 'bbands'   Bollinger Bands. Default length=20, stddev=2. "
         "Returns {date, upper, middle, lower}.\n"
-        "  - 'macd'   MACD with fixed (fast=12, slow=26, signal=9); `length` is "
-        "ignored. Returns {date, macd, hist, signal}.\n\n"
+        "  - 'macd'     MACD with fixed (fast=12, slow=26, signal=9); `length` is "
+        "ignored. Returns {date, macd, hist, signal}.\n"
+        "\n"
         "To respect no-look-ahead, pass date_end <= your current target trading "
         "day. Values are rounded to 4 decimals."
     )
 )
 def get_indicator(
-    ticker: Annotated[str, Field(description="Stock ticker, e.g. 'AAPL'")],
+    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
     date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
     indicator: Annotated[
@@ -197,17 +205,20 @@ def get_indicator(
             "Must be one of: ma, rsi, bbands, macd."
         )
 
+    # For variable-length indicators, scale warmup to the requested length.
     warmup_days = _INDICATOR_WARMUP_DAYS[ind]
+    if ind != "macd" and length:
+        warmup_days = max(warmup_days, length * 3)
     fetch_start = (
         date.fromisoformat(date_start) - timedelta(days=warmup_days)
     ).isoformat()
 
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT date, price FROM prices "
-            "WHERE ticker = ? AND date >= ? AND date <= ? "
+            "SELECT CAST(date AS VARCHAR) AS date, adj_close AS price FROM prices "
+            "WHERE symbol = ? AND date >= ? AND date <= ? "
             "ORDER BY date ASC",
-            [ticker, fetch_start, date_end],
+            [symbol, fetch_start, date_end],
         ).fetchall()
 
     if not rows:

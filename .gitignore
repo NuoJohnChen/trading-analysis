@@ -47,8 +47,8 @@ financial_agentic_benchmark/
 context_as_world/
 refs/
 
-# Trading skill DuckDB
+# DuckDB
 
-trading/db/*.duckdb
-trading/db/*.duckdb.wal
+*.duckdb
+*.duckdb.wal
 
