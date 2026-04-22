@@ -1,103 +1,89 @@
 ---
 name: auditing
 description: >
-  Audits XBRL numeric facts in SEC-style filings by comparing the reported (book)
-  value from the instance document against the correct (true) expected value derived
-  from the filing's calculation linkbase, US-GAAP taxonomy, and XBRL sign conventions.
-  The correct value may be a summation recomputation, a sign correction for directional
-  concepts (expenditures, losses must be positive), or an algebraic derivation.
-  Handles fact extraction, context resolution, period matching, balance-type checking,
-  and writing the final JSON result to results/auditing/.
+  Audits one SEC filing (10-K or 10-Q) by cross-checking its MD&A section
+  against its Risk Factors section. For a given (symbol, date,
+  document_type, audit_id) tuple, fetches the filing via the `trading_mcp`
+  server's `get_filings` tool, extracts notable forward-looking or comparative
+  claims from `mda_content`, checks whether each is reflected or contradicted
+  in `risk_content`, and writes one structured JSON audit result to
+  `results/auditing/`.
 
-  Use this skill whenever the user asks to audit a filing, verify a reported XBRL
-  value, compute a calculated value from linkbases, or check numeric consistency in
-  a 10-K or 10-Q — even if they phrase it as "what is the reported value of X",
-  "audit this concept", "check the filing math", or "verify AssetsCurrent for FY2021".
+  Use this skill whenever the user asks to audit a filing, cross-check an
+  MD&A against its risk disclosures, flag risk coverage gaps, or assess
+  disclosure consistency in a 10-K or 10-Q — phrased as "audit Apple's
+  2024-09-28 10-K", "check MD&A consistency for NVDA Q1", "flag risk
+  disclosure gaps in META 10-Q", or "run the auditing task on AAPL 10-K".
 ---
 
 # Auditing Skill
 
-You are auditing a single XBRL numeric fact in an SEC-style filing. Your job is to:
-1. Extract the **reported (book) value** — the number literally stored in the filing's instance document.
-2. Determine the **correct (true) value** — what the number *should be* in a valid XBRL filing.
-3. Write one line of JSON to the output file.
+You are auditing one SEC filing (10-K or 10-Q) by cross-checking its MD&A
+section against its Risk Factors section. Your job is to:
 
-These two values may differ. The correct value is **not always a mathematical recomputation** — it depends on the nature of the concept:
-- For **summation concepts** (a concept that is the parent of children in `*_cal.xml`): recompute by summing weighted children.
-- For **directional concepts** (expenditures, losses, deductions, contra-assets): the correct value is always a **positive absolute value** — the sign is encoded in the concept semantics, not in a negative number.
-- For **child concepts** (a component within a parent sum): derive algebraically from the parent and siblings.
-- For **other concepts** with no calculation relationships: report the value as found if it is consistent with its balance type.
+1. **Extract notable claims** from the MD&A — forward-looking statements, comparative performance claims, and material operational narratives.
+2. **Check risk coverage** — for each claim, determine whether the Risk Factors section addresses the underlying risk, contradicts the claim, or leaves it unaddressed.
+3. **Surface concerns** — flag coverage gaps, tone inconsistencies, or specific contradictions.
+4. **Write one JSON line of output.**
 
-Integrity of the audit depends on never substituting taxonomy-inferred relationships
-for filing-specific ones, and never silently mismatching periods or contexts.
-Read this skill carefully before starting.
+Data access is via the `trading_mcp` MCP server. There is no parquet, no XBRL
+XML, no external API.
 
-For input and output paths, the user will provide them directly. For example:
-"The data is at `/data/auditing`", "Please save results to `/results/auditing`".
+---
 
-A typical user request looks like:
+## Inputs
+
+The user invocation specifies:
+
+| Parameter | Example | Notes |
+|---|---|---|
+| `agent_name` | `claude-code`, `codex` | your agent name, used in the output filename |
+| `symbol` | `AAPL`, `NVDA` | one of the 8 supported symbols |
+| `date` | `2024-09-28` | `YYYY-MM-DD`, must match a filing row in the DB |
+| `document_type` | `10-K`, `10-Q` | case matters, uppercase with hyphen |
+| `audit_id` | `mr_1`, `audit_001` | free-form identifier from the user's request, used verbatim in the filename |
+| `model` | `claude-sonnet-4-6` | your model identifier; sanitize for filename use (replace any character that is not alphanumeric, `-`, or `_` with `_`; lowercase) |
+
+Example user request:
 
 ```
-Please audit the value of us-gaap:AdjustmentsRelatedToTaxWithholdingForShareBasedCompensation
-for 2023-01-01 to 2023-12-31 in the 10k filing released by rrr on 2023-12-31.
-What's the reported value? What's the actual value calculated from the relevant
-linkbases and US-GAAP taxonomy? (id: mr_1)
-The input data is at /data/auditing, please save the output to /results/auditing.
+Please audit Apple's 10-K released 2024-09-28. (id: mr_1)
+Save the output to results/auditing/.
 ```
 
 ---
 
-## Setup
+## Data access — DuckDB via MCP
 
-### Parse the request into these parameters
+One tool is used for this skill:
 
-| Parameter     | Example                    | Notes |
-|---------------|----------------------------|-------|
-| `agent_name`  | `claude-code`, `codex`     | your agent name, e.g. "claude-code"; used in output filename |
-| `ticker`      | `rrr`, `zions`             | **lowercase** as it appears in folder names |
-| `issue_time`  | `20231231`                 | format `YYYYMMDD` |
-| `filing_name` | `10k`, `10q`               | lowercase |
-| `concept_id`  | `us-gaap:AssetsCurrent`    | exact concept name including namespace prefix |
-| `period`      | `FY2021`, `Q3 2022`, `2021-12-31`, `2021-01-01 to 2021-12-31` | user's expression |
-| `id`          | `mr_1`                     | the value from `(id: ...)` in the user's request; used verbatim in the output filename |
-| `model`       | `claude-sonnet-4-6`        | your model identifier from system context; sanitize for filename use |
+| Tool | Purpose |
+|---|---|
+| `get_filings(symbol, date_start, date_end, document_type?)` | Returns rows `{symbol, date, document_type, mda_content, risk_content}`. Call with `date_start == date_end == {date}` to fetch one specific filing. |
 
-### Locate the filing folder
+### Fetching the target filing
 
-```
-data/auditing/XBRL/{filing_name}-{ticker}-{issue_time}/
-```
-
-Example: `data/auditing/XBRL/10k-zions-20231231/`
-
-Within that folder, you need these files:
-
-| File pattern  | Purpose |
-|---------------|---------|
-| `*_htm.xml`   | Instance document — all reported facts and contexts **(primary)** |
-| `*_cal.xml`   | Calculation linkbase — summation-item relationships + locators **(primary)** |
-| `*.xsd`       | Extension schema — concept definitions, use if extension names are unclear |
-| `*_def.xml`   | Definition linkbase — dimensional relationships, use if needed |
-| `*_lab.xml`   | Label linkbase — human-readable concept labels, use if needed |
-| `*_pre.xml`   | Presentation linkbase — statement structure, use if needed |
-| `*.htm`       | **Ignore** — human-readable HTML, never used |
-
-### Locate the taxonomy folder
-
-```
-data/auditing/US_GAAP_Taxonomy/gaap_chunks_{year}/
+```python
+rows = get_filings(
+    symbol=SYMBOL,
+    date_start=DATE,
+    date_end=DATE,
+    document_type=DOCUMENT_TYPE,
+)
+if not rows:
+    raise RuntimeError(f"No filing found for {SYMBOL} {DATE} {DOCUMENT_TYPE}")
+filing = rows[0]
+mda  = filing["mda_content"]   # MD&A narrative, 5k to 25k chars typically
+risk = filing["risk_content"]  # Risk Factors, 30k to 100k chars typically
 ```
 
-Where `{year}` matches the filing year derived from `issue_time` (e.g., `20231231` → `2023`).
-Each taxonomy folder contains:
-- `chunks_core.jsonl` — concept labels and types (one JSON object per line)
-- `chunks_relations.jsonl` — taxonomy-level relationships
-- `meta.json` — taxonomy metadata
+Both fields contain the raw section text as filed (HTML-entity-encoded).
+Treat them as plain text for audit purposes — do not attempt to re-parse
+HTML.
 
-Use taxonomy files only to clarify concept semantics and sanity-check results —
-never to replace filing-specific calculation networks.
+---
 
-### Ensure the output directory exists
+## Ensure the output directory exists
 
 ```
 results/auditing/
@@ -109,149 +95,55 @@ Create it if it doesn't exist yet.
 
 ## The audit workflow
 
-Work through this checklist in order. Never skip steps or reorder them.
+Work through this checklist in order.
 
-### Step 1 — Extract reported facts for the target concept
+### Step 1 — Extract notable MD&A claims
 
-Open `*_htm.xml`. Find all elements whose local name matches the concept from
-`concept_id` (strip the `us-gaap:` prefix — e.g., `us-gaap:AssetsCurrent` →
-look for elements named `AssetsCurrent`). For each matching element:
+Read `mda_content` and identify **5–10** notable claims. A claim is notable
+if it is:
 
-- Note its numeric value
-- Note its `contextRef` attribute
-- Follow `contextRef` to the matching `<context id="...">` element in the same file
-- Read the period from that context:
-  - `<instant>` → instant date
-  - `<startDate>` + `<endDate>` → duration range
-- Keep only facts whose resolved context period matches the user's requested period exactly
+- a **comparative performance statement** (growth rates, revenue comparisons vs prior year, margin expansion / compression)
+- a **forward-looking or guidance-adjacent statement** (expected demand, planned investments, strategic direction)
+- a **material operational narrative** (new product launches, geographic expansion, customer concentration changes, litigation status)
 
-**Do not determine the period type first and then search.** Always resolve
-`fact → contextRef → context id → period` before filtering.
+Numeric statements (e.g., "revenue grew 9% to $X billion") are preferred
+over qualitative ones for audit tractability.
 
-Do not silently switch between:
-- instant and duration
-- quarter-only and year-to-date
-- current period and prior period
-- consolidated and dimensional contexts
+Record each claim as a short quote or paraphrase plus a one-line topic tag.
 
-### Step 2 — Select the best candidate fact
+### Step 2 — Check risk coverage
 
-Rank candidates by these preferences (highest first):
+For each MD&A claim, scan `risk_content` for the corresponding risk category:
 
-1. Exact concept match
-2. Exact period match (after resolving contextRef)
-3. No dimensions before dimensional facts
-4. Numeric facts before non-numeric facts
+- **`covered`** — the Risk Factors section discusses the risk that would materialize if the MD&A claim failed to hold (e.g., claim: "We expect continued China revenue growth"; risk coverage: a risk paragraph explicitly naming China, trade policy, or export controls).
+- **`partial`** — related risks are discussed but not at the level of specificity the MD&A claim implies (e.g., claim: "We invested $X billion in AI"; risk coverage: general technology-investment risk but no AI-specific disclosure).
+- **`absent`** — no matching risk category found. This is the highest-signal finding.
+- **`contradictory`** — a risk paragraph actively disputes or softens the MD&A claim (e.g., MD&A says "strong pricing power"; risk says "margin compression from competition").
 
-Use the top-ranked fact as `extracted_value` unless the user explicitly asks for a
-segmented or dimensional fact. If multiple candidates remain equally plausible, report
-the ambiguity rather than forcing a single answer.
+Ground each classification by citing **one short anchor phrase** from `risk_content`.
 
-### Step 3 — Build the calculation network from `*_cal.xml`
+### Step 3 — Assess tone consistency
 
-The calculation linkbase has two parts you must read together:
+Compare the two sections holistically:
 
-**Part A — Locators** (`<link:loc>` elements):
-Each locator maps a label string to a concept name via its `xlink:href`:
-```xml
-<link:loc xlink:label="loc_us-gaap_Liabilities_UUID"
-          xlink:href="https://...#us-gaap_Liabilities"/>
-```
-The concept name is the fragment after `#` (e.g., `us-gaap_Liabilities`).
-Build a lookup table: `label → concept_name`.
+- **`consistent`** — MD&A's forward narrative is appropriately bounded by Risk Factors disclosures.
+- **`mildly_divergent`** — MD&A is notably more optimistic than Risk Factors or vice versa, but within typical SEC filing variance.
+- **`strongly_divergent`** — a reasonable reader would conclude MD&A and Risk Factors describe materially different company outlooks.
 
-> **Normalization:** href fragments use underscores (`us-gaap_Liabilities`) while
-> `concept_id` in the request uses a colon (`us-gaap:Liabilities`). Treat them as
-> equivalent — normalize by replacing `:` with `_` (or vice versa) before matching.
+### Step 4 — Surface concerns
 
-**Part B — Arcs** (`<link:calculationArc>` elements):
-```xml
-<link:calculationArc xlink:from="loc_us-gaap_Liabilities_UUID"
-                     xlink:to="loc_us-gaap_Deposits_UUID"
-                     weight="1.0" .../>
-```
-**Arc direction: `xlink:from` = PARENT (the sum), `xlink:to` = CHILD (a component).**
+List the top 2–4 specific findings. A finding is worth listing if:
 
-Using your locator lookup table, resolve `xlink:from` and `xlink:to` labels to
-actual concept names. Then determine the target concept's role in the network:
+- It is an **`absent`** coverage gap with material implications.
+- It is a **`contradictory`** pair (MD&A vs Risk Factors).
+- It is a **numeric claim** in MD&A that lacks any sensitivity or contingency framing in Risk Factors.
 
-- **As a parent (Case A):** find arcs where the resolved `from` concept matches the target `concept_id`. Those arcs' `to` concepts (with their `weight`) are the calculation children. Note the calculation role (`xlink:role` on the enclosing `<link:calculationLink>`). If multiple roles contain the concept as a parent, prefer the role whose child coverage best matches the available facts.
+Each finding is one sentence, specific to the claim and the anchor text.
 
-- **As a child (Case C):** find arcs where the resolved `to` concept matches the target `concept_id`. Note the parent concept (`from`) and all sibling `to` concepts with their weights in the same role — these are needed for the algebraic derivation in Step 4.
+### Step 5 — Overall assessment
 
-- **Neither:** the concept has no calculation relationships; Case D applies.
-
-### Step 4 — Determine the correct (calculated) value
-
-First, check the concept's **balance type** from `*.xsd` (attribute `balance="debit"` or
-`balance="credit"`) or from `chunks_core.jsonl` in the taxonomy. This tells you the
-concept's directional nature and governs which case applies below.
-
-Cases are **not mutually exclusive** — a concept can match more than one. Apply every case that matches and combine the results: Case A gives the numeric value, Case B enforces the sign. If both A and B apply, `calculated_value` = `abs(sum of weighted children)`.
-
----
-
-**Case A — Summation parent** (the target concept appears as `xlink:from` in `*_cal.xml`)
-
-Recompute by summing weighted children:
-1. Find each child fact in `*_htm.xml` (strip `us-gaap:` prefix to match element names)
-2. Resolve its `contextRef` to a context
-3. Keep it only if the context period matches the chosen parent fact's period exactly
-4. Prefer the same dimension signature as the chosen parent fact
-5. Multiply the child fact value by its arc `weight` and sum all contributions
-
-→ `calculated_value` = sum of `weight × child_value` for all matched children.
-
-If some children have no matching fact, the recomputation is **partial** — still
-report the sum of available children but note it is partial.
-
----
-
-**Case B — Directional concept** (expenditure, loss, deduction, contra-asset, or any
-concept that represents an outflow or reduction — typically `balance="debit"` for
-expense/loss items, or `balance="credit"` for contra-asset/contra-equity items)
-
-In XBRL, directional concepts must always be filed as **positive absolute values**.
-The sign is implied by the concept's semantics; a negative sign in the instance
-document is a filing error.
-
-- If `extracted_value` is negative → `calculated_value` = `abs(extracted_value)`
-- If `extracted_value` is already positive → `calculated_value` = same value (correctly reported)
-
-When the concept is also a summation parent (Cases A and B both apply), first recompute the sum from children (Case A), then apply the sign rule: `calculated_value` = `abs(recomputed sum)`.
-
----
-
-**Case C — Calculation child only** (the target concept appears as `xlink:to` but
-never as `xlink:from` in `*_cal.xml`)
-
-Derive algebraically from the parent relationship:
-`calculated_value` = `(parent_value - sum(sibling_weight × sibling_value)) / own_weight`
-
-Use exact weights and matching contexts for all sibling and parent facts.
-
----
-
-**Case D — No calculation relationships and neutral balance type**
-
-No recomputation is possible and no sign correction is required.
-→ `calculated_value` = `extracted_value` (report as found).
-State explicitly that no calculation network was found and no sign correction applies.
-
----
-
-## Ambiguity handling
-
-Pay extra attention when:
-
-- Multiple filing folders match the same ticker and issue date
-- The concept appears as a parent in several calculation roles
-- The filing uses extension concepts (custom `xlink:href` fragments) that change the expected subtotal
-- The selected calculation role has many missing children
-- Multiple candidate facts survive period filtering (dimensional vs. non-dimensional)
-
-In these cases, surface the ambiguity in a brief note before writing the output file —
-but the output file must still contain exactly one JSON line.
+A 2–3 sentence paragraph summarizing the most important finding, the
+strongest area of consistency, and an overall disclosure-quality verdict.
 
 ---
 
@@ -260,61 +152,79 @@ but the output file must still contain exactly one JSON line.
 Write a single `.json` file to:
 
 ```
-results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{id}_{model}.json
+results/auditing/{agent_name}_auditing_{symbol}_{document_type}_{date}_{audit_id}_{model}.json
 ```
 
-Example: `results/auditing/claude-code_auditing_10k_zions_20231231_mr_1_claude-sonnet-4-6.json`
+Sanitize `document_type` by replacing `-` with `_` for filename safety:
+`10-K` → `10_K`, `10-Q` → `10_Q`.
 
-The file must contain **exactly one line**: the final JSON object.
+Example: `results/auditing/claude-code_auditing_AAPL_10_K_2024-09-28_mr_1_claude-sonnet-4-6.json`
+
+The file is a single JSON object (pretty-printed is OK). Schema:
 
 ```json
-{"extracted_value": "-1234567000", "calculated_value": "1234567000"}
+{
+  "symbol": "AAPL",
+  "date": "2024-09-28",
+  "document_type": "10-K",
+  "audit_id": "mr_1",
+  "mda_claims": [
+    {
+      "claim": "Services revenue grew 13% year-over-year, reaching a record.",
+      "topic": "services_revenue_growth"
+    }
+  ],
+  "risk_coverage_check": [
+    {
+      "topic": "services_revenue_growth",
+      "coverage": "partial",
+      "risk_anchor": "The Company faces significant competition in services markets and pricing pressure from alternative offerings.",
+      "note": "Services competition is discussed but no specific risk to the 13% growth rate is flagged."
+    }
+  ],
+  "tone_consistency": "mildly_divergent",
+  "concerns": [
+    "MD&A cites record services revenue growth without a matched risk disclosure of growth-rate deceleration.",
+    "MD&A's AI investment narrative has no corresponding AI-specific risk category in Risk Factors."
+  ],
+  "overall_assessment": "The filing's MD&A presents growth narratives in four major segments with partial or absent risk coverage for two of them. Risk Factors is exhaustive in macro and regulatory categories but under-discloses product-level risks that would materialize if MD&A growth assumptions fail. Overall disclosure quality is adequate but tilts optimistic."
+}
 ```
-
-*(Example: a loss concept was filed as negative — the correct value is the positive absolute.)*
 
 **Field rules:**
 
 | Field | Rule |
-|-------|------|
-| `extracted_value` | Numeric string **exactly as it appears** in the instance document (may be negative); `"0"` if not found |
-| `calculated_value` | Numeric string of the **correct expected value** per Step 4 (Case A/B/C/D); `"0"` if not determinable |
+|---|---|
+| `symbol`, `date`, `document_type`, `audit_id` | Echoed from inputs verbatim |
+| `mda_claims` | 5–10 entries, each with `claim` and `topic` |
+| `risk_coverage_check` | One entry per MD&A claim, keyed by `topic`; each has `coverage` in `{covered, partial, absent, contradictory}`, a `risk_anchor` quote (or empty string if coverage == `absent`), and a one-sentence `note` |
+| `tone_consistency` | Exactly one of `consistent`, `mildly_divergent`, `strongly_divergent` |
+| `concerns` | 2–4 sentence-level findings, each specific to a claim or anchor phrase |
+| `overall_assessment` | 2–3 sentence paragraph |
 
-- Output JSON only on that line. No explanation, no Markdown fences, no extra keys.
-- Preserve numeric values exactly as strings (do not reformat or round).
-- Write the file once, after completing both steps. Do not append or overwrite.
+Do not add keys beyond the schema above.
 
 ---
 
 ## What NOT to do
 
-- Do not replace filing-specific calculation networks with taxonomy-only relationships
-  unless the filing network is absent (and state that fallback explicitly)
-- Do not silently switch period types (instant vs. duration, quarter vs. YTD)
-- Do not use `.htm` files — each filing folder contains six XBRL files (`*_htm.xml`, `*_cal.xml`, `*_def.xml`, `*_lab.xml`, `*_pre.xml`, `*.xsd`); the primary ones are `*_htm.xml` and `*_cal.xml`, but the others may be consulted if needed
-- Do not confuse arc direction: `xlink:from` = parent (sum), `xlink:to` = child (component)
-- Do not report a negative `calculated_value` for directional concepts (expenditures, losses, deductions) — these must always be positive absolute values in valid XBRL
-- Do not use locator label strings as concept names — always resolve via `<link:loc xlink:href>`
-- Do not create temporary scripts, debug logs, or intermediate files
-- Do not write multiple output files for the same audit run
-- Do not add any text outside the JSON on the output line
+- Do **not** read parquet files, XBRL XML, or US-GAAP taxonomy files. Data comes from `get_filings` only.
+- Do **not** call external APIs or parse the original SEC website.
+- Do **not** invent quotes — every `risk_anchor` must appear in `risk_content` (substring match is enough).
+- Do **not** produce audits for multiple filings in one invocation. One `(symbol, date, document_type, audit_id)` per call.
+- Do **not** write intermediate scripts, debug logs, or partial files.
 
 ---
 
 ## Implementation approach
 
-The cleanest approach: write a short inline Python script via the Bash tool that
-parses the XML files, resolves all locators and contexts, applies the correct Case
-(A/B/C/D), and writes the final JSON. Keep all computation in memory. Do not save
-the script to disk.
+The cleanest approach: run short inline Python via the Bash tool that
 
-Recommended libraries: `xml.etree.ElementTree` for XML parsing, `json` for output,
-`re` or string operations for concept name normalization. No third-party packages
-needed.
+1. Calls `get_filings(symbol, date, date, document_type)` and confirms exactly one row.
+2. Reads `mda_content` and `risk_content` into variables.
+3. Extracts 5–10 MD&A claims (you, the agent, reason over the text and pick them).
+4. For each claim, scans `risk_content` for a corresponding category and records the coverage classification with a short anchor phrase.
+5. Computes tone-consistency and concerns holistically.
+6. Writes the output JSON to the sanitized filename.
 
-Suggested script structure:
-1. Parse `*_htm.xml` → build `{concept_name: [(value, period, dimensions)]}` lookup
-2. Parse `*.xsd` or search `chunks_core.jsonl` → get balance type of target concept
-3. Parse `*_cal.xml` → build locator table, then identify the concept as parent / child / neither
-4. Apply Case A/B/C/D to compute `calculated_value`
-5. Print `{"extracted_value": "...", "calculated_value": "..."}` and write to output file
+Keep all intermediate state in memory. Do not save the script to disk.

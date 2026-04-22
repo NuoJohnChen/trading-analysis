@@ -1,24 +1,27 @@
-"""Seed trading/db/trading_env.duckdb with a small sample dataset for smoke-testing.
+"""Seed a small trading_env.duckdb for smoke tests (new 3-table schema).
 
-Generates:
-- ~32 trading days of AAPL prices (2025-01-02 through 2025-02-14)
-- Weekdays only (Mon-Fri)
-- One forward-filled "holiday" (2025-01-20 MLK Day) with price == prior trading day
-- A few news rows and one 10-Q filing row
+Creates:
+- ~40 trading days of AAPL OHLCV prices (Mon-Fri only, 2025-01-02 .. 2025-02-28)
+- 6 news rows across that window
+- 2 filings (one 10-K, one 10-Q)
 
-The DuckDB path defaults to {repo_root}/trading/db/trading_env.duckdb but can
-be overridden via TRADING_DB_PATH.
+The DuckDB path defaults to {repo_root}/trading/env/trading_env.duckdb unless
+TRADING_DB_PATH is set.
+
+Note: for running the skills against REAL production data, use
+scripts/download_data.py to pull from HuggingFace TheFinAI/ab instead.
+This seed is meant only for offline CI / smoke runs.
 """
 
 import os
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DB = REPO_ROOT / "trading" / "db" / "trading_env.duckdb"
+DEFAULT_DB = REPO_ROOT / "trading" / "env" / "trading_env.duckdb"
 DB_PATH = Path(os.environ.get("TRADING_DB_PATH", str(DEFAULT_DB)))
 SCHEMA_SQL = (REPO_ROOT / "trading" / "mcp" / "schema.sql").read_text()
 
@@ -31,48 +34,56 @@ con.execute(SCHEMA_SQL)
 
 random.seed(42)
 start = date(2025, 1, 2)
-end = date(2025, 2, 15)
+end = date(2025, 2, 28)
 
-price = 240.00
+# US market holidays in the seeded range — match real-DB behavior of storing
+# rows only for actual trading days (no forward-fill).
+MARKET_HOLIDAYS = {
+    date(2025, 1, 20),   # MLK Day
+    date(2025, 2, 17),   # Presidents Day
+}
+
 rows = []
-last_trading_price = None
+close = 240.00
+pid = 0
 d = start
 while d <= end:
-    if d.weekday() < 5:
-        if d == date(2025, 1, 20):
-            rows.append((d.isoformat(), last_trading_price, "neutral"))
-        else:
-            price = round(price + random.uniform(-3.0, 3.2), 2)
-            momentum = (
-                "up" if rows and price > rows[-1][1]
-                else ("down" if rows and price < rows[-1][1] else "neutral")
-            )
-            rows.append((d.isoformat(), price, momentum))
-            last_trading_price = price
+    if d.weekday() < 5 and d not in MARKET_HOLIDAYS:
+        pid += 1
+        open_ = round(close + random.uniform(-1.5, 1.5), 4)
+        close = round(open_ + random.uniform(-3.0, 3.2), 4)
+        high = round(max(open_, close) + random.uniform(0.0, 1.5), 4)
+        low = round(min(open_, close) - random.uniform(0.0, 1.5), 4)
+        adj_close = close  # no splits/dividends in synthetic data
+        volume = random.randint(30_000_000, 90_000_000)
+        rows.append((pid, "AAPL", d, open_, high, low, close, adj_close, volume))
     d += timedelta(days=1)
 
 con.executemany(
-    "INSERT INTO prices (ticker, date, price, momentum) VALUES ('AAPL', ?, ?, ?)",
+    "INSERT INTO prices (id, symbol, date, open, high, low, close, adj_close, volume) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     rows,
 )
 
 news_rows = [
-    ("AAPL", "2025-01-06", 1, "Apple announces new iPhone software features at CES."),
-    ("AAPL", "2025-01-15", 1, "Analysts raise AAPL price target on services growth."),
-    ("AAPL", "2025-01-15", 2, "Apple Vision Pro reported softer than expected demand."),
-    ("AAPL", "2025-02-03", 1, "Apple reports strong fiscal Q1 earnings, beats EPS estimates."),
-    ("AAPL", "2025-02-10", 1, "Apple expands App Store developer tools."),
+    (1, "AAPL", datetime(2025, 1, 6, 14, 30),  "Apple announces new iPhone features at CES",          "https://example.com/aapl/1", "Apple announces new iPhone features at CES. Wall Street reacts positively..."),
+    (2, "AAPL", datetime(2025, 1, 15, 9, 0),   "Analysts raise AAPL price target on services growth", "https://example.com/aapl/2", "Analysts raise AAPL price target on services growth..."),
+    (3, "AAPL", datetime(2025, 1, 15, 16, 45), "Apple Vision Pro demand reported softer than expected","https://example.com/aapl/3", "Apple Vision Pro demand reported softer than expected..."),
+    (4, "AAPL", datetime(2025, 2, 3, 8, 0),    "Apple beats Q1 EPS estimates",                         "https://example.com/aapl/4", "Apple reports strong fiscal Q1 earnings, beats EPS estimates."),
+    (5, "AAPL", datetime(2025, 2, 10, 13, 15), "Apple expands App Store developer tools",              "https://example.com/aapl/5", "Apple expands App Store developer tools this week."),
+    (6, "AAPL", datetime(2025, 2, 22, 18, 0),  "Analyst note: AI investments to pay off in FY25",      "https://example.com/aapl/6", "Weekend analyst note on Apple's AI investment trajectory."),
 ]
 con.executemany(
-    "INSERT INTO news (ticker, date, item_id, content) VALUES (?, ?, ?, ?)",
+    "INSERT INTO news (id, symbol, date, title, url, highlights) VALUES (?, ?, ?, ?, ?, ?)",
     news_rows,
 )
 
 filing_rows = [
-    ("AAPL", "2025-02-03", "10-Q", "Apple Inc. Q1 FY25 10-Q: revenue $124.3B, services $26.3B."),
+    (1, "AAPL", date(2025, 2, 3), "MD&A: revenue grew 9% YoY to $124.3B. Services hit record $26.3B.", "Risk Factors: macro conditions, supply chain concentration, and foreign exchange could materially affect results.", "10-Q"),
+    (2, "AAPL", date(2024, 11, 1), "MD&A: FY24 revenue $391B. iPhone units strong. Services margin expansion.", "Risk Factors: competition in AI, regulatory scrutiny in EU and US, component supply exposure.", "10-K"),
 ]
 con.executemany(
-    "INSERT INTO filings (ticker, filing_date, form_type, content) VALUES (?, ?, ?, ?)",
+    "INSERT INTO filings (id, symbol, date, mda_content, risk_content, document_type) VALUES (?, ?, ?, ?, ?, ?)",
     filing_rows,
 )
 
@@ -80,9 +91,6 @@ con.commit()
 con.close()
 
 print(f"Seeded DB at: {DB_PATH}")
-print(f"Prices rows: {len(rows)}")
-print(f"First: {rows[0]}")
-print(f"MLK  : {[r for r in rows if r[0] == '2025-01-20']}")
-print(f"Last : {rows[-1]}")
-print(f"News : {len(news_rows)} rows")
-print(f"Filings: {len(filing_rows)} rows")
+print(f"Prices rows : {len(rows)}  (AAPL {start} to {end}, weekdays only)")
+print(f"News rows   : {len(news_rows)}")
+print(f"Filings rows: {len(filing_rows)}  ({sum(1 for f in filing_rows if f[5]=='10-K')} 10-K, {sum(1 for f in filing_rows if f[5]=='10-Q')} 10-Q)")

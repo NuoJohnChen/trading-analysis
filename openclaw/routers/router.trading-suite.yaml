@@ -22,7 +22,6 @@ router:
             - weekly report
             - evaluate reports
             - audit filing
-            - XBRL
       action:
         type: invoke_skill
         skill_id: pair_trading
@@ -51,7 +50,6 @@ router:
             - produce weekly report
             - trading decision
             - pair trading
-            - XBRL
             - audit filing
       action:
         type: invoke_skill
@@ -60,7 +58,7 @@ router:
     - id: use-report-generation-skill
       enabled: true
       priority: 90
-      description: Generate weekly equity research reports for a single ticker.
+      description: Generate weekly equity research reports for a single symbol.
       when_all:
         - any_keyword:
             - generate report
@@ -80,7 +78,6 @@ router:
             - trading decision
             - pair trading
             - audit filing
-            - XBRL
       action:
         type: invoke_skill
         skill_id: report_generation
@@ -88,21 +85,19 @@ router:
     - id: use-auditing-skill
       enabled: true
       priority: 88
-      description: XBRL numeric fact audit in SEC-style filings.
+      description: Per-filing MD&A vs Risk Factors consistency audit.
       when_all:
         - any_keyword:
             - audit filing
-            - audit this concept
-            - XBRL
-            - reported value
-            - calculated value
-            - instance document
-            - calculation linkbase
-            - US-GAAP
+            - audit this filing
+            - check MD&A consistency
+            - flag risk disclosure gaps
+            - cross-check filing
+            - MD&A
+            - risk factors
+            - disclosure gap
             - 10-K
             - 10-Q
-            - FY20
-            - us-gaap:
       unless_any:
         - any_keyword:
             - trade
@@ -118,7 +113,7 @@ router:
     - id: use-trading-skill
       enabled: true
       priority: 85
-      description: Single-day BUY/SELL/HOLD decision for one ticker.
+      description: Single-day BUY/SELL/HOLD decision for one symbol.
       when_all:
         - any_keyword:
             - trade
@@ -134,8 +129,6 @@ router:
             - AAPL
             - ADBE
             - AMZN
-            - BMRN
-            - CRM
             - GOOGL
             - META
             - MSFT
@@ -149,24 +142,22 @@ router:
             - generate report
             - evaluate reports
             - audit filing
-            - XBRL
       action:
         type: invoke_skill
         skill_id: trading
 
-    - id: direct-ticker-date-phrasing
+    - id: direct-symbol-date-phrasing
       enabled: true
       priority: 83
-      description: Catch bare "trade {TICKER} on {date}" phrasings.
+      description: Catch bare "trade {SYMBOL} on {date}" phrasings.
       when_all:
         - any_regex:
-            - '(?i)\b(trade|decide)\s+(AAPL|ADBE|AMZN|BMRN|CRM|GOOGL|META|MSFT|NVDA|TSLA)\b'
+            - '(?i)\b(trade|decide)\s+(AAPL|ADBE|AMZN|GOOGL|META|MSFT|NVDA|TSLA)\b'
       unless_any:
         - any_keyword:
             - pair
             - report
             - audit
-            - XBRL
       action:
         type: invoke_skill
         skill_id: trading

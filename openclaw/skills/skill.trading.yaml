@@ -3,10 +3,10 @@ skill:
   id: trading
   display_name: Single-Day Trading Decision Skill
   description: >
-    Makes a single daily BUY/SELL/HOLD decision for one stock on a given
+    Makes a single daily BUY/SELL/HOLD decision for one symbol on a given
     target_date by querying an offline DuckDB via the `trading_mcp` server.
-    One (ticker, target_date) pair per invocation. Result is upserted into a
-    per-ticker action-list JSON file. The caller drives replay (loop over
+    One (symbol, target_date) pair per invocation. Result is upserted into a
+    per-symbol action-list JSON file. The caller drives replay (loop over
     historical dates) or live trading (pass today, or omit the date to use
     the latest DuckDB date).
   enabled: true
@@ -32,12 +32,10 @@ routing:
       - daily decision
       - action list
       - single-stock decision
-    tickers:
+    symbols:
       - AAPL
       - ADBE
       - AMZN
-      - BMRN
-      - CRM
       - GOOGL
       - META
       - MSFT
@@ -55,7 +53,6 @@ routing:
     - generate report
     - equity research
     - audit filing
-    - XBRL
     - evaluate reports
 
 model_selection:
@@ -72,48 +69,46 @@ mcp_servers:
     args:
       - trading/mcp/trading_mcp.py
     env:
-      TRADING_DB_PATH: ${TRADING_DB_PATH:-trading/db/trading_env.duckdb}
+      TRADING_DB_PATH: ${TRADING_DB_PATH:-trading/env/trading_env.duckdb}
     required: true
 
 tools:
   - name: get_prices
     mcp_server: trading_mcp
-    signature: "(ticker, date_start, date_end) -> rows[{ticker, date, price, momentum}]"
-    purpose: recent prices and momentum labels in a date range
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, open, high, low, close, adj_close, volume}]"
+    purpose: OHLCV rows; adj_close is the canonical trading price
   - name: get_news
     mcp_server: trading_mcp
-    signature: "(ticker, date_start, date_end) -> rows[{ticker, date, item_id, content}]"
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, id, title, highlights}]"
     purpose: per-date news items (zero or more per date)
   - name: get_filings
     mcp_server: trading_mcp
-    signature: "(ticker, date_start, date_end, form_type?) -> rows[{ticker, filing_date, form_type, content}]"
-    purpose: 10-K / 10-Q filings whose filing_date falls in range
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_content, risk_content}]"
+    purpose: 10-K / 10-Q filings with MD&A and Risk Factors sections pre-extracted
   - name: get_indicator
     mcp_server: trading_mcp
-    signature: "(ticker, date_start, date_end, indicator, length?) -> rows"
-    purpose: technical indicators computed from prices (ma/rsi/bbands/macd)
+    signature: "(symbol, date_start, date_end, indicator, length?) -> rows"
+    purpose: technical indicators computed from the prices table (ma / rsi / bbands / macd)
     notes: >
-      ma default length 20, rsi default length 14, bbands default length 20
-      with stddev=2, macd uses fixed 12/26/9 and ignores length. The server
-      auto-fetches warmup history before date_start internally.
+      ma default length 20, rsi default 14, bbands default 20 with stddev=2,
+      macd uses fixed 12/26/9 and ignores length. Computed from adj_close. The
+      server auto-fetches warmup history before date_start internally.
   - name: get_latest_date
     mcp_server: trading_mcp
-    signature: "(ticker) -> latest_date"
-    purpose: latest available date in DuckDB for the ticker (used only when target_date is not supplied)
+    signature: "(symbol) -> latest_date"
+    purpose: latest available date in DuckDB for the symbol
 
 input_schema:
   required:
-    - ticker
+    - symbol
   optional:
     - target_date
     - agent_name
     - model_name
-  tickers_whitelist:
+  symbols_whitelist:
     - AAPL
     - ADBE
     - AMZN
-    - BMRN
-    - CRM
     - GOOGL
     - META
     - MSFT
@@ -121,14 +116,14 @@ input_schema:
     - TSLA
   date_format: "YYYY-MM-DD"
   defaults:
-    target_date: "get_latest_date(ticker)"
+    target_date: "get_latest_date(symbol)"
     agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
     model_name: "inherit from model_selection.preferred_model"
 
 context_packing:
   include_in_order:
     - skill_procedure
-    - ticker
+    - symbol
     - target_date
     - recent_prices
     - recent_news
@@ -139,11 +134,11 @@ context_packing:
 
 output_artifacts:
   - kind: upsert_json
-    path_template: "results/trading/trading_{TICKER}_{agent_name}_{model}.json"
+    path_template: "results/trading/trading_{SYMBOL}_{agent_name}_{model}.json"
     key: date
     record_schema:
       date: "YYYY-MM-DD"
-      price: float
+      price: "adj_close (float)"
       recommended_action:
         enum: [BUY, SELL, HOLD]
     document_shape:
@@ -163,104 +158,106 @@ output_artifacts:
 
 constraints:
   no_look_ahead:
-    description: "date_end must be <= target_date for get_prices / get_news / get_filings"
+    description: "date_end must be <= target_date for all MCP calls"
     applies_to: [get_prices, get_news, get_filings, get_indicator]
   non_trading_day_forced_hold:
     description: >
-      Force action = HOLD when target_date is Saturday (weekday 5) or Sunday
-      (weekday 6), OR when get_prices for target_date returns a row whose
-      price equals the most recent prior row's price exactly (forward-fill
-      detection for market holidays).
+      Force action = HOLD when target_date is Saturday or Sunday, OR when
+      get_prices returns no row for target_date and target_date <=
+      get_latest_date(symbol). DuckDB stores rows only for actual trading
+      days (no forward-fill).
     on_trigger:
       - skip get_news / get_filings / get_indicator
-      - upsert using price_today from target_date row (forward-filled value)
+      - upsert using adj_close from the most recent prior trading day
       - briefly note the non-trading day to the user
   data_missing_stop:
     description: >
-      If get_prices returns no row for target_date after the sanity-check call,
-      that date is not yet in DuckDB. Stop and report. Do not fabricate a
-      decision. Do not upsert.
+      If get_prices returns no row for target_date AND target_date >
+      get_latest_date(symbol), the date is not yet in DuckDB. Stop and
+      report. Do not fabricate a decision. Do not upsert.
   single_pair_per_invocation:
-    description: "Exactly one (ticker, target_date) per invocation. Caller loops for replay."
+    description: "Exactly one (symbol, target_date) per invocation."
 
 behavior_rules:
   - All market data comes from MCP tools on the `trading_mcp` server. Never read parquet files directly.
   - Query ranges must always satisfy date_end <= target_date. No look-ahead.
-  - HOLD is mandatory on non-trading days (weekend + forward-fill detection).
+  - HOLD is mandatory on non-trading days (weekend + missing-row detection).
   - Output JSON is upserted keyed by date. Never rewrite the file from scratch.
   - Leave status = "in_progress". The caller decides when to mark completed.
   - recommended_action must be exactly "BUY", "SELL", or "HOLD".
+  - Price saved in the upsert record is the adj_close from the target_date row.
   - Do not emit intermediate scripts, debug logs, or partial output files.
 
 procedure:
   - step: 1
     name: resolve_target_date
-    description: If target_date is supplied use it. Otherwise call get_latest_date(ticker).
+    description: If target_date is supplied use it. Otherwise call get_latest_date(symbol).
   - step: 2
-    name: sanity_check_data
-    description: Call get_prices(ticker, target_date - 4 days, target_date). If no row for target_date, stop and report.
+    name: fetch_recent_prices
+    description: Call get_prices(symbol, target_date - 7 days, target_date) to enumerate nearby trading days.
   - step: 3
-    name: non_trading_day_check
+    name: non_trading_day_or_missing_check
     description: >
-      From the rows in step 2, apply (a) weekday check, (b) forward-fill
-      equality check. If either fires, set action = HOLD and jump to step 7.
+      Apply weekday check. Apply missing-row check against the step-2 result
+      plus get_latest_date(symbol) to distinguish market holiday (force
+      HOLD) from not-yet-loaded (stop).
   - step: 4
     name: gather_context
     description: >
-      Call get_prices (wider range), get_news, and (when warranted) get_filings.
-      Optionally call get_indicator for one or more of ma / rsi / bbands / macd.
-      All ranges must end at target_date or earlier.
+      Call get_prices (wider range), get_news, and optionally get_filings
+      and get_indicator. All ranges must end at target_date or earlier.
   - step: 5
     name: extract_price_today
-    description: price_today is the price value from the get_prices row where date == target_date.
+    description: price_today is the adj_close from the get_prices row where date == target_date.
   - step: 6
     name: decide
-    description: Weigh price trend, news, filings, and any indicators to pick BUY | SELL | HOLD.
+    description: Weigh OHLCV trend, news (title+highlights), filings (MD&A+Risk), and any indicators to pick BUY | SELL | HOLD.
   - step: 7
     name: upsert_record
     description: Run the inline Python upsert via Bash. Keep intermediate state in memory only.
 
 prompt_template: |
   You are the single-day trading decision skill. Make exactly one
-  BUY / SELL / HOLD decision for ticker `{ticker}` on `{target_date}` using
+  BUY / SELL / HOLD decision for symbol `{symbol}` on `{target_date}` using
   only the offline DuckDB exposed by the `trading_mcp` MCP server.
 
   Canonical procedure is documented at: {procedure_source}
 
   Inputs:
-    ticker       = {ticker}
+    symbol       = {symbol}
     target_date  = {target_date}   (if empty, call get_latest_date)
     agent_name   = {agent_name}
     model        = {model_name}
 
   Available MCP tools on `trading_mcp`:
-    - get_prices(ticker, date_start, date_end)
-    - get_news(ticker, date_start, date_end)
-    - get_filings(ticker, date_start, date_end, form_type?)
-    - get_indicator(ticker, date_start, date_end, indicator, length?)
-    - get_latest_date(ticker)
+    - get_prices(symbol, date_start, date_end)    (OHLCV; adj_close is canonical)
+    - get_news(symbol, date_start, date_end)      (title + highlights per row)
+    - get_filings(symbol, date_start, date_end, document_type?)
+      (mda_content + risk_content per row)
+    - get_indicator(symbol, date_start, date_end, indicator, length?)
+    - get_latest_date(symbol)
 
   Hard rules:
     1. Never query any tool with date_end > target_date.
     2. Never read parquet files directly. All data comes from the MCP server.
-    3. Force action = HOLD when target_date is a weekend or when the
-       get_prices row for target_date forward-fills the prior trading day
-       (price equality with the most recent prior row).
-    4. If get_prices returns no row for target_date, stop and report to the
-       user. Do not fabricate a decision. Do not upsert.
+    3. Force action = HOLD when target_date is a weekend or when get_prices
+       returns no row for target_date AND target_date <= get_latest_date.
+    4. If get_prices returns no row for target_date AND target_date >
+       get_latest_date, stop and report to the user. Do not fabricate a
+       decision. Do not upsert.
     5. Upsert exactly one record into
-         results/trading/trading_{TICKER}_{agent_name}_{model}.json
+         results/trading/trading_{SYMBOL}_{agent_name}_{model}.json
        keyed by `date`. Leave `status` = "in_progress".
 
   Output record schema:
-    {"date": "{target_date}", "price": <float>, "recommended_action": "BUY"|"SELL"|"HOLD"}
+    {"date": "{target_date}", "price": <adj_close float>, "recommended_action": "BUY"|"SELL"|"HOLD"}
 
   Do not emit debug scripts, partial files, or reasoning text into the output
   JSON. Keep user-facing commentary brief.
 
 output:
   format: json
-  primary_artifact: "results/trading/trading_{TICKER}_{agent_name}_{model}.json"
+  primary_artifact: "results/trading/trading_{SYMBOL}_{agent_name}_{model}.json"
   side_effects:
     - upsert one record keyed by date into the artifact above
     - leave document status as "in_progress"
