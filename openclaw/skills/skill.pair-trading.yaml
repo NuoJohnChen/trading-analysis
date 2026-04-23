@@ -1,0 +1,223 @@
+version: 1
+skill:
+  id: pair_trading
+  display_name: Pair Trading Skill
+  description: >
+    Executes a daily pair-trading decision task over a 3-month window
+    (2025-03-01 to 2025-05-31) on an 8-symbol pool using the `trading_mcp`
+    MCP server. On the first trading day, selects one pair from the pool
+    using only information visible up to that day (emphasis on first-day
+    news). Then trades the selected pair day by day chronologically with
+    strict no-look-ahead discipline, writing one final structured JSON to
+    results/pair_trading/.
+  enabled: true
+  procedure_source: ../../pair_trading/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 92
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - run pair trading
+      - execute pair trading
+      - do pair trading
+      - process pair trading
+      - select a pair
+      - trade a pair
+    nouns:
+      - pair trading task
+      - pair trading simulation
+      - pair trading experiment
+      - stock pair
+      - pair trade
+    actions:
+      - LONG_SHORT
+      - SHORT_LONG
+  negative_triggers:
+    - single-stock decision
+    - weekly report
+    - equity research
+    - audit filing
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: trading_mcp
+    command: python3
+    args:
+      - trading/mcp/trading_mcp.py
+    env:
+      TRADING_DB_PATH: ${TRADING_DB_PATH:-trading/env/trading_env.duckdb}
+    required: true
+
+tools:
+  - name: get_prices
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, open, high, low, close, adj_close, volume}]"
+  - name: get_news
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, id, title, highlights}]"
+  - name: get_filings
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_content, risk_content}]"
+  - name: get_indicator
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end, indicator, length?) -> rows"
+    notes: optional; useful when a technical signal helps confirm/contradict the read
+
+runtime:
+  executor: claude-code-mcp
+
+symbol_pool:
+  - AAPL
+  - ADBE
+  - AMZN
+  - GOOGL
+  - META
+  - MSFT
+  - NVDA
+  - TSLA
+
+input_schema:
+  required: []
+  optional:
+    - output_dir
+    - agent_name
+    - model_name
+  defaults:
+    output_dir: results/pair_trading
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - symbol_pool
+    - pair_selection_window
+    - target_window
+    - first_day_cross_symbol_news
+    - fixed_pair_chronological_rows
+  max_context_chars: 120000
+  truncation_policy: keep_selected_pair_and_current_day
+
+output_artifacts:
+  - kind: single_json_write_at_end
+    path_template: "results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json"
+    document_shape:
+      status:
+        enum: [completed, partial]
+      start_date: string
+      end_date: string
+      agent: string
+      model: string
+      recommendations: array
+    record_schema:
+      pair: "string, fixed order, e.g. 'META, MSFT'"
+      date: "YYYY-MM-DD"
+      price: "object mapping each symbol to its adj_close for that day"
+      recommended_action:
+        enum: [LONG_SHORT, SHORT_LONG, HOLD]
+      trajectory: "2 to 3 sentence reasoning"
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+constraints:
+  target_window:
+    start: "2025-03-01"
+    end: "2025-05-31"
+    rule: Process only trading days present in the DB within this window.
+  pair_selection_window:
+    start: "2025-01-01"
+    end: "first trading day in target window"
+    rule: >
+      Pair selection uses only information from this pre-window plus the
+      first trading day.
+  pair_selection_immutability:
+    rule: >
+      Select the pair exactly once on the first trading day. The selected
+      pair must not change for any subsequent day.
+  no_look_ahead:
+    rule: >
+      On each trading day t, every MCP call must use date_end <= t. Never
+      pre-scan later dates. Never use future returns, future spread behavior,
+      or future news to choose or revise the pair.
+  skip_misaligned_days:
+    rule: >
+      If either symbol in the selected pair has no row on day t, skip that
+      day (do not write a HOLD record for it).
+  fixed_pair_order:
+    rule: >
+      The pair string is written in the same fixed order throughout the file,
+      e.g. "META, MSFT". LONG_SHORT means long the first symbol, short the
+      second. SHORT_LONG is the reverse. HOLD means no directional exposure.
+
+behavior_rules:
+  - All market data comes from the `trading_mcp` MCP server. Never read parquet files directly.
+  - News cross-symbol comparison on the first trading day is the primary pair-selection signal. OHLCV trend and pre-window filings are supporting signals.
+  - Each daily trajectory is 2 to 3 sentences grounded in visible data, naming the long leg and short leg explicitly.
+  - Write the output JSON exactly once at the end, not incrementally.
+  - Do not create temporary scripts, notebooks, debug logs, or intermediate files.
+
+procedure:
+  - step: 1
+    name: determine_first_trading_day
+    description: Call get_prices for one symbol scoped to 2025-03-01 to 2025-03-07; take the earliest returned date as T1.
+  - step: 2
+    name: select_pair
+    description: >
+      For each of the 8 symbols, call get_prices / get_news / get_filings
+      scoped to [2025-01-01, T1]. Pick one ordered pair based on first-day
+      news and visible history. Record it.
+  - step: 3
+    name: chronological_loop
+    description: >
+      For each trading day t in [T1, 2025-05-31], call MCP tools for both
+      pair symbols scoped to date_end <= t, decide LONG_SHORT / SHORT_LONG
+      / HOLD, append to the in-memory recommendations list.
+  - step: 4
+    name: finalize_and_write
+    description: >
+      Set status (completed or partial) and write a single JSON file to the
+      output path.
+
+prompt_template: |
+  You are the pair-trading skill. Execute a daily pair-trading simulation
+  on the 8-symbol pool over 2025-03-01 to 2025-05-31. Produce one JSON file
+  at the end. Never look ahead.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Symbol pool: AAPL, ADBE, AMZN, GOOGL, META, MSFT, NVDA, TSLA
+  Data: `trading_mcp` MCP server (offline DuckDB).
+
+  Two stages:
+    1. Pair selection (first trading day only): pick one pair using only
+       visible information up to the first trading day. Emphasis: first-day
+       news across all 8 symbols.
+    2. Pair trading: for each trading day t in the window, decide
+       LONG_SHORT | SHORT_LONG | HOLD for the fixed pair, write a 2 to 3
+       sentence trajectory naming the long leg and short leg.
+
+  Hard rules:
+    - Selection must be finalized on day 1 and never revised.
+    - The pair string is written in fixed order throughout the file.
+    - Skip days where either pair symbol has no row.
+    - Write the JSON exactly once at the end. No partial files.
+    - Do not save Python scripts or debug logs to disk.
+
+  Output path: results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json
+
+output:
+  format: json
+  primary_artifact: "results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json"
+  write_strategy: single_write_at_end
+  chat_return: "brief summary of selected pair, date range, and total trading days processed"
