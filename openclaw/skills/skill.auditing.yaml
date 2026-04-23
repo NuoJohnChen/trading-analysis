@@ -1,0 +1,229 @@
+version: 1
+skill:
+  id: auditing
+  display_name: Filing MD&A vs Risk Factors Consistency Audit
+  description: >
+    Audits one SEC filing (10-K or 10-Q) by cross-checking its MD&A section
+    against its Risk Factors section. Fetches the filing via the `trading_mcp`
+    server's `get_filings` tool, extracts notable forward-looking or
+    comparative claims from `mda_content`, classifies each against
+    `risk_content` as covered / partial / absent / contradictory, and writes
+    one structured JSON audit result to results/auditing/.
+  enabled: true
+  procedure_source: ../../auditing/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 88
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - audit
+      - audit this filing
+      - check MD&A consistency
+      - flag risk disclosure gaps
+      - cross-check filing
+      - assess filing disclosure
+    nouns:
+      - filing
+      - 10-K
+      - 10-Q
+      - MD&A
+      - risk factors
+      - disclosure gap
+    phrasings:
+      - "audit Apple's 2024-09-28 10-K"
+      - "check MD&A consistency for NVDA"
+      - "flag risk disclosure gaps in META 10-Q"
+      - "run the auditing task on AAPL"
+  negative_triggers:
+    - trade
+    - trading decision
+    - pair trading
+    - weekly report
+    - generate report
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: trading_mcp
+    command: python3
+    args:
+      - trading/mcp/trading_mcp.py
+    env:
+      TRADING_DB_PATH: ${TRADING_DB_PATH:-trading/env/trading_env.duckdb}
+    required: true
+
+tools:
+  - name: get_filings
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_content, risk_content}]"
+    purpose: fetch one specific filing row for cross-section audit
+
+runtime:
+  executor: claude-code-mcp
+
+input_schema:
+  required:
+    - symbol
+    - date
+    - document_type
+    - audit_id
+  optional:
+    - agent_name
+    - model_name
+    - output_dir
+  examples:
+    symbol: AAPL
+    date: "2024-09-28"
+    document_type: "10-K"
+    audit_id: "mr_1"
+  defaults:
+    output_dir: results/auditing
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+  symbols_whitelist:
+    - AAPL
+    - ADBE
+    - AMZN
+    - GOOGL
+    - META
+    - MSFT
+    - NVDA
+    - TSLA
+  field_rules:
+    symbol: uppercase
+    date: "format YYYY-MM-DD, must match a filings row"
+    document_type: "exactly '10-K' or '10-Q'"
+    audit_id: "verbatim from the user's request, used in filename (after sanitizing)"
+
+output_artifacts:
+  - kind: single_json
+    path_template: "results/auditing/{agent_name}_auditing_{SYMBOL}_{DOCUMENT_TYPE_SAFE}_{date}_{audit_id}_{model}.json"
+    filename_sanitization:
+      document_type_safe: "replace '-' with '_' in document_type ('10-K' -> '10_K')"
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+    record_schema:
+      symbol: string
+      date: "YYYY-MM-DD"
+      document_type: "10-K | 10-Q"
+      audit_id: string
+      mda_claims:
+        type: array
+        length: "5 to 10"
+        item_schema:
+          claim: string
+          topic: string
+      risk_coverage_check:
+        type: array
+        length: "one per mda_claim, keyed by topic"
+        item_schema:
+          topic: string
+          coverage:
+            enum: [covered, partial, absent, contradictory]
+          risk_anchor: "short quote from risk_content, or empty string when coverage == absent"
+          note: "one-sentence rationale"
+      tone_consistency:
+        enum: [consistent, mildly_divergent, strongly_divergent]
+      concerns:
+        type: array
+        length: "2 to 4"
+        item_schema: "single sentence specific to a claim or anchor phrase"
+      overall_assessment: "2 to 3 sentence paragraph"
+    strict_rules:
+      - "JSON object only, no Markdown fences"
+      - "no keys beyond the ones in record_schema"
+      - "every risk_anchor must appear as a substring of risk_content (except when coverage == absent, in which case risk_anchor is empty)"
+
+constraints:
+  single_filing_per_invocation:
+    rule: "Exactly one (symbol, date, document_type, audit_id) per invocation."
+  anchor_must_be_substring:
+    rule: "Each non-empty risk_anchor must appear verbatim (substring match) in risk_content. Do not paraphrase the anchor."
+  claim_count_bounds:
+    rule: "mda_claims must have between 5 and 10 entries."
+  coverage_classification:
+    rule: >
+      Classify each claim as covered, partial, absent, or contradictory.
+      'absent' is the highest-signal finding and must be flagged prominently
+      in concerns. 'contradictory' means a risk paragraph actively disputes
+      or softens the MD&A claim.
+  mcp_only:
+    rule: "Data comes only from get_filings(symbol, date, date, document_type). No parquet, no XBRL XML, no taxonomy files, no network."
+
+behavior_rules:
+  - Use only the `trading_mcp` get_filings tool to load the target filing.
+  - Treat mda_content and risk_content as plain text (do not parse HTML entities).
+  - Prefer numeric / forward-looking / comparative claims over generic qualitative ones when selecting the 5 to 10 mda_claims.
+  - Every risk_anchor must be a verbatim substring of risk_content.
+  - The output JSON must be self-contained and have no keys beyond the schema.
+  - Do not create temporary scripts, debug logs, or intermediate files.
+
+procedure:
+  - step: 1
+    name: fetch_filing
+    description: Call get_filings(symbol, date, date, document_type) and confirm exactly one row returned.
+  - step: 2
+    name: extract_mda_claims
+    description: Read mda_content. Identify 5 to 10 notable claims — forward-looking, comparative, or material operational. Record claim text + topic tag for each.
+  - step: 3
+    name: classify_risk_coverage
+    description: For each claim, scan risk_content for the corresponding category. Record coverage (covered / partial / absent / contradictory), a risk_anchor quote, and a one-sentence note.
+  - step: 4
+    name: tone_consistency
+    description: Classify overall tone as consistent / mildly_divergent / strongly_divergent.
+  - step: 5
+    name: concerns
+    description: List 2 to 4 specific findings (absent coverage with material implications, contradictions, or numeric MD&A claims lacking sensitivity in risk).
+  - step: 6
+    name: overall_assessment
+    description: 2 to 3 sentence paragraph summarizing the strongest finding and the overall disclosure-quality verdict.
+  - step: 7
+    name: write_output
+    description: Emit the JSON to results/auditing/<sanitized_filename>.json.
+
+prompt_template: |
+  You are the filing auditing skill. Audit exactly one SEC filing by
+  cross-checking its MD&A against its Risk Factors section.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    symbol         = {symbol}
+    date           = {date}
+    document_type  = {document_type}      ('10-K' or '10-Q')
+    audit_id       = {audit_id}
+    agent_name     = {agent_name}
+    model          = {model_name}
+
+  Data access:
+    get_filings(symbol, date, date, document_type) → one row with
+      mda_content and risk_content.
+
+  Hard rules:
+    - 5 to 10 mda_claims with topic tags.
+    - For each claim, classify risk coverage (covered / partial / absent /
+      contradictory) with a short verbatim risk_anchor quote.
+    - 'absent' coverage is the highest-signal finding.
+    - tone_consistency ∈ {consistent, mildly_divergent, strongly_divergent}.
+    - 2 to 4 specific concerns.
+    - 2 to 3 sentence overall_assessment.
+    - JSON output only. No keys beyond the schema. No Markdown fences.
+
+  Output path:
+    results/auditing/{agent_name}_auditing_{SYMBOL}_{DOCUMENT_TYPE_SAFE}_{date}_{audit_id}_{model}.json
+    (DOCUMENT_TYPE_SAFE replaces '-' with '_': '10-K' -> '10_K')
+
+output:
+  format: json
+  primary_artifact: "results/auditing/{agent_name}_auditing_{SYMBOL}_{DOCUMENT_TYPE_SAFE}_{date}_{audit_id}_{model}.json"
+  write_strategy: single_write
+  chat_return: "brief summary naming the strongest finding and the tone_consistency label"
