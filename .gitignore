@@ -52,3 +52,6 @@ refs/
 *.duckdb
 *.duckdb.wal
 
+# asciinema cast files (raw recordings; only the .gif goes into docs/)
+*.cast
+

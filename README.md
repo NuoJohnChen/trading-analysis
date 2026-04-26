@@ -5,6 +5,28 @@ generation, report evaluation) plus the MCP server and data plumbing they
 depend on. All five skills run against a single shared DuckDB (8-symbol
 pool) exposed through the `trading_mcp` MCP server.
 
+## Demo
+
+One user prompt — `trade AAPL on 2025-05-28` — drives the trading skill
+end to end via Claude Code: spawn the `trading_mcp` MCP server, fetch
+prices / news / filings / indicators, reason over the data, write a
+single upserted record to `results/trading/`. ~110 s, ~$0.30 wall cost.
+
+![trade AAPL via Claude Code](docs/demo-claude.gif)
+
+The `openclaw` YAML harness is a real spec, not just paper. The minimal
+runner at `scripts/openclaw_run.py` loads `openclaw/skills/skill.trading.yaml`,
+extracts the model + MCP server config, and dispatches the same flow
+through Claude Code. Same outcome, packaged behind the openclaw entry
+point so the spec has a working reference implementation.
+
+```bash
+python3 scripts/openclaw_run.py --symbol AAPL --target-date 2025-05-28
+```
+
+![openclaw_run.py POC](docs/demo-openclaw.gif)
+
+
 The skill definitions are consumed two ways:
 
 - **Claude Code** reads each skill's Markdown at `<skill>/SKILL.md` (human-readable, prose procedure).
